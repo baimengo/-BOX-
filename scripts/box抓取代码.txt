@@ -1,0 +1,37 @@
+// 极简版：无大括号 | 每行ID:突破数 | 自动复制 | 仅SS/SSR
+const elements = document.querySelectorAll('[class*="item"], [class*="icon"], [class*="card"]');
+const data = [];
+
+elements.forEach(el => {
+  const rarityImg = el.querySelector('.role-rarity');
+  if (!rarityImg) return;
+  
+  const src = rarityImg.src;
+  // 仅筛选SSR/SS
+  if (!src.includes('IconRaritySSR') && !src.includes('IconRaritySS')) return;
+
+  const id = el.dataset.id;
+  if (!id) return;
+
+  const breakEl = el.querySelector('.limit-break-level div');
+  const breakNum = breakEl ? parseInt(breakEl.textContent) || 0 : 0;
+
+  data.push({ id: Number(id), breakNum });
+});
+
+// 按ID排序
+data.sort((a, b) => a.id - b.id);
+
+// 生成纯文本：每行 ID:突破数（无大括号、无引号）
+const result = data.map(item => `${item.id}:${item.breakNum}`).join('\n');
+
+// 自动复制到剪贴板
+navigator.clipboard.writeText(result).then(() => {
+  console.log('✅ 已自动复制！直接 Ctrl+V 粘贴');
+  console.log('------------------------');
+  console.log(result);
+}).catch(() => {
+  console.log('❌ 自动复制失败，手动复制下方内容：');
+  console.log('------------------------');
+  console.log(result);
+});

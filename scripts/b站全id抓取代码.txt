@@ -1,0 +1,15 @@
+
+
+全id提取
+
+// 仅提取角色ID（排序好，一行一个）
+const elements = document.querySelectorAll('[class*="item"], [class*="icon"], [class*="card"]');
+const ids = [];
+elements.forEach(el => {
+  const rarityImg = el.querySelector('.role-rarity');
+  if (!rarityImg) return;
+  const id = el.dataset.id;
+  if (id) ids.push(id);
+});
+const sortedIds = [...new Set(ids)].sort((a, b) => a - b);
+console.log(sortedIds.join('\n'));
