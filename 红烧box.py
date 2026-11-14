@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -12,11 +13,22 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext
+from runtime_paths import DATA_DIR, FROZEN, PACKAGE_DIR
 from PIL import Image, ImageTk
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-BASE_DIR = Path(__file__).resolve().parent
+from avatar_mapping import (
+    ask_match_permission,
+    download_box_images,
+    resolve_unknown_styles,
+    review_avatar_matches,
+    unknown_prefixes,
+)
+from element_box import create_element_box_preview
+
+BASE_DIR = DATA_DIR
+APP_SETTINGS_FILE = BASE_DIR / "程序设置.json"
 USER_DATA_DIR = BASE_DIR / "bilibili_user_data"
 STATE_FILE = BASE_DIR / "bilibili_storage_state.json"
 COOKIE_FILE = BASE_DIR / "bilibili_cookies.json"
@@ -26,7 +38,7 @@ LOGIN_URL = "https://passport.bilibili.com/login"
 HBR_URL = "https://game.bilibili.com/tool/hbr/"
 NAV_API_URL = "https://api.bilibili.com/x/web-interface/nav"
 BOX_URL = "https://ruriro.cc/hbr/StyleChart/"
-MAPPING_FILE = BASE_DIR / "映射表(泳装二六版本).txt"
+MAPPING_FILE = BASE_DIR / "当前映射表.txt"
 VIEWPORT = {"width": 1440, "height": 960}
 DEFAULT_TIMEOUT_MS = 15000
 PAGE_LOAD_TIMEOUT_MS = 30000
@@ -41,10 +53,10 @@ HBR_SCROLL_STEP_PX = 900
 HBR_SCROLL_MAX_ROUNDS = 60
 HBR_STABLE_ROUNDS = 5
 HBR_PREPARE_RETRIES = 3
+HBR_ARCHIVE_READY_TIMEOUT_MS = 15000
+HBR_ARCHIVE_VIEW_ALL_TIMEOUT_MS = 15000
 HBR_IDS_FILE = BASE_DIR / "b站ss_ssr_id列表.txt"
 HBR_BREAK_DATA_FILE = BASE_DIR / "b站ss_ssr突破列表.txt"
-HBR_TAB_SELECTORS = '[role="tab"], .van-tab'
-HBR_ARCHIVE_TAB_INDEX = 2
 HBR_ARCHIVE_READY_KEYWORDS = ["累计登录天数", "已解锁风格", "查看全部"]
 HBR_ARCHIVE_VIEW_ALL_TEXT = "查看全部"
 BOX_PAGE_IDLE_TIMEOUT_MS = 12000
@@ -71,12 +83,12 @@ BOX_READY_KEYWORDS = [
     "style",
 ]
 BOX_REGION_OPTIONS = ("CN", "JP", "EN")
+BOX_DOWNLOAD_ICON_PREFIX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALgAAAC4"
 BOX_BUTTON_MIN_SIZE = 40
 BOX_DOWNLOAD_TIMEOUT_MS = 30000
 BOX_PREVIEW_MAX_SIZE = (1100, 720)
 BOX_FALLBACK_SUFFIX = "_截图兜底"
 MAPPING_HISTORY_PREFIX = "映射表_"
-BROWSER_HEADLESS = True
 MAPPING_HISTORY_KEEP_COUNT = 5
 QR_TAB_SELECTORS = [
     "text=扫码登录",
@@ -113,6 +125,7 @@ QR_EXPIRED_KEYWORDS = [
 ]
 LOGIN_COOKIE_NAMES = {"SESSDATA", "DedeUserID"}
 HBR_CARD_SELECTOR = '[class*="item"], [class*="icon"], [class*="card"]'
+HBR_ARCHIVE_CARD_SELECTOR = '.card-box .style-item.card[data-id]'
 HBR_SCROLL_CONTAINER_SELECTORS = [
     ".page.developing",
     ".page",
@@ -164,7 +177,29 @@ def log(stage, message):
         except Exception:
             continue
 
+def load_show_browser():
+    try:
+        settings = json.loads(APP_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(settings, dict) and settings.get("show_browser") is True
+
+def save_show_browser(enabled):
+    temp_path = APP_SETTINGS_FILE.with_name(APP_SETTINGS_FILE.name + ".tmp")
+    try:
+        temp_path.write_text(
+            json.dumps({"show_browser": bool(enabled)}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, APP_SETTINGS_FILE)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+def browser_headless():
+    return not load_show_browser()
+
 def ensure_dirs():
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     MAPPING_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -192,15 +227,30 @@ def parse_mapping_value(mapping_value):
         raise RuntimeError(f"无法解析映射值: {mapping_value}")
     return matched.group(1), int(matched.group(2))
 
+def initialize_mapping_table():
+    mapping = {"1001103": "1:31a-1-1"}
+    save_mapping_table(mapping)
+    log("映射表", "映射表缺失或为空，已添加初始映射: 1001103: 1:31a-1-1")
+    return mapping
+
+
 def load_mapping_table():
     if not MAPPING_FILE.exists():
-        raise RuntimeError(f"未找到映射表文件: {MAPPING_FILE}")
+        bundled_mapping = PACKAGE_DIR / MAPPING_FILE.name
+        if FROZEN and bundled_mapping.is_file():
+            ensure_dirs()
+            shutil.copyfile(bundled_mapping, MAPPING_FILE)
+            log("映射表", f"已从安装包初始化映射表: {MAPPING_FILE}")
+            return load_mapping_table()
+        return initialize_mapping_table()
     mapping = {}
+    has_content = False
     with MAPPING_FILE.open("r", encoding="utf-8") as file:
         for raw_line in file:
             line = raw_line.strip()
             if not line:
                 continue
+            has_content = True
             idx = line.index(":") if ":" in line else -1
             if idx == -1:
                 continue
@@ -209,7 +259,9 @@ def load_mapping_table():
             if style_id and mapping_value:
                 mapping[style_id] = mapping_value
     if not mapping:
-        raise RuntimeError("映射表为空或格式无效。")
+        if has_content:
+            raise RuntimeError("映射表格式无效。")
+        return initialize_mapping_table()
     log("映射表", f"已读取 {len(mapping)} 条映射。")
     return mapping
 
@@ -272,6 +324,7 @@ def archive_mapping_snapshot(content):
     return history_path
 
 def save_mapping_table(mapping):
+    ensure_dirs()
     new_content = format_mapping_table(mapping)
     old_content = MAPPING_FILE.read_text(encoding="utf-8") if MAPPING_FILE.exists() else ""
     if old_content == new_content:
@@ -282,8 +335,18 @@ def save_mapping_table(mapping):
     log("映射表", f"映射表已更新: {MAPPING_FILE}")
     return True
 
-def reconcile_mapping_table(mapping, all_style_ids):
-    normalized_ids = sorted({normalize_style_id(style_id) for style_id in all_style_ids}, key=int)
+def reconcile_mapping_table(mapping, all_style_ids, inferred_mapping=None, preserve_prefixes=()):
+    inferred_mapping = inferred_mapping or {}
+    occupied_keys = set(mapping.values())
+    for style_id, box_key in inferred_mapping.items():
+        if style_id in mapping or box_key in occupied_keys:
+            raise RuntimeError(f"头像匹配与现有映射冲突: {style_id} -> {box_key}")
+        occupied_keys.add(box_key)
+    mapping = {**mapping, **inferred_mapping}
+    normalized_ids = sorted(
+        {normalize_style_id(style_id) for style_id in all_style_ids},
+        key=int,
+    )
     all_by_prefix = {}
     for style_id in normalized_ids:
         prefix = get_style_character_prefix(style_id)
@@ -295,9 +358,11 @@ def reconcile_mapping_table(mapping, all_style_ids):
         group = mapping_by_prefix.setdefault(prefix, {"stem": stem, "ids": []})
         group["ids"].append((style_id, slot_index))
     updated_mapping = dict(mapping)
-    changed = False
+    changed = bool(inferred_mapping)
     unresolved_prefixes = []
     for prefix, ids in all_by_prefix.items():
+        if prefix in preserve_prefixes:
+            continue
         group = mapping_by_prefix.get(prefix)
         if not group:
             unresolved_prefixes.append(prefix)
@@ -376,13 +441,52 @@ def load_box_write_data_file():
     log("BOX同步", f"已读取 {len(normalized)} 条本地 BOX 写入数据。")
     return normalized
 
-def run_mapping_update():
-    hbr_result = bilibili_login(update_bili_ids=True, update_break_data=False)
+def run_mapping_update(hbr_result=None):
+    mapping = load_mapping_table()
+    if hbr_result is None:
+        hbr_result = bilibili_login(update_bili_ids=True, update_break_data=False)
     all_ids = hbr_result.get("ids") or []
     if not all_ids:
         raise RuntimeError("未获取到 B站 SS/SSR 全量 ID，无法更新映射表。")
-    mapping = load_mapping_table()
-    return reconcile_mapping_table(mapping, all_ids)
+    unknown = unknown_prefixes(mapping, all_ids)
+    additions = {}
+    if unknown:
+        if not ask_match_permission(unknown):
+            log("头像匹配", "用户取消头像匹配；映射表未修改。")
+            return None
+        avatar_roles = hbr_result.get("avatar_roles") or {}
+        if not avatar_roles:
+            raise RuntimeError("未取得养成助手的圆形角色头像数据；映射表未保存。")
+        log("头像匹配", "正在读取 BOX 卡片头像...")
+        box_images = download_box_images(BOX_URL)
+        review_items = {}
+        additions = resolve_unknown_styles(
+            mapping, all_ids, avatar_roles, box_images,
+            on_skip=lambda style_id: log("头像匹配", f"已跳过角色 {style_id}，继续处理下一项。"),
+            review_items=review_items,
+        )
+        if additions:
+            approved = review_avatar_matches(review_items)
+            if approved is None:
+                log("头像匹配", "已取消最终复核，本轮新增映射未保存。")
+                return None
+            if any(additions.get(style_id) != value for style_id, value in approved.items()):
+                raise RuntimeError("最终复核返回了不在本轮候选中的映射，未保存。")
+            additions = approved
+    return reconcile_mapping_table(mapping, all_ids, inferred_mapping=additions,
+                                   preserve_prefixes=unknown)
+
+def update_mapping_for_box_sync(hbr_result):
+    try:
+        updated = run_mapping_update(hbr_result=hbr_result)
+    except Exception as exc:
+        log("BOX同步", f"更新映射表失败，将继续使用现有映射表: {exc}")
+        return load_mapping_table()
+    if updated is None:
+        log("BOX同步", "映射表未更新，继续使用现有映射表生成 BOX 图。")
+        return load_mapping_table()
+    return updated
+
 
 def run_generate_box_write_data_from_files():
     mapping = load_mapping_table()
@@ -537,13 +641,19 @@ class QRCodePopup:
         self.close()
 
 class BoxPreviewPopup:
-    def __init__(self, image_path):
+    def __init__(self, image_path, element_path=None, element_error=None):
         self.image_path = Path(image_path)
+        self.images = [("原版 BOX", self.image_path)]
+        if element_path is not None:
+            self.images.append(("属性 BOX", Path(element_path)))
+        self.element_error = element_error
+        self.current_index = 0
         self.root = None
         self.closed = False
         self.choice = None
         self.selected_dir = None
         self.image_label = None
+        self.image_name_label = None
         self.status_label = None
         self.photo = None
         self.preview_max_size = BOX_PREVIEW_MAX_SIZE
@@ -553,6 +663,8 @@ class BoxPreviewPopup:
         self.root.title("BOX 图预览")
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
+        self.root.bind("<Left>", lambda event: self._change_image(-1))
+        self.root.bind("<Right>", lambda event: self._change_image(1))
         self.root.configure(bg=APP_THEME["bg"])
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -562,7 +674,7 @@ class BoxPreviewPopup:
         center_window(self.root, window_width, window_height)
         self.preview_max_size = (
             max(520, window_width - 160),
-            max(320, window_height - 260),
+            max(320, window_height - 310),
         )
         shell = tk.Frame(self.root, bg=APP_THEME["bg"], padx=24, pady=24)
         shell.pack(fill=tk.BOTH, expand=True)
@@ -584,6 +696,8 @@ class BoxPreviewPopup:
             font=("Microsoft YaHei UI", 10),
         )
         subtitle.pack(anchor="w", pady=(6, 0))
+        footer = tk.Frame(shell, bg=APP_THEME["bg"])
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
         preview_card = tk.Frame(
             shell,
             bg=APP_THEME["surface"],
@@ -594,29 +708,52 @@ class BoxPreviewPopup:
             pady=18,
         )
         preview_card.pack(fill=tk.BOTH, expand=True)
+        navigation = tk.Frame(preview_card, bg=APP_THEME["surface"])
+        navigation.pack(fill=tk.X, pady=(0, 10))
+        tk.Button(
+            navigation, text="←", width=5, command=lambda: self._change_image(-1),
+            state=tk.NORMAL if len(self.images) > 1 else tk.DISABLED,
+            bg=APP_THEME["surface_alt"], fg=APP_THEME["text"],
+            activebackground=APP_THEME["border"], activeforeground=APP_THEME["text"],
+            relief=tk.FLAT, bd=0, font=("Segoe UI Symbol", 12),
+        ).pack(side=tk.LEFT)
+        self.image_name_label = tk.Label(
+            navigation, text=self._current_image_title(), bg=APP_THEME["surface"],
+            fg=APP_THEME["text"], font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        self.image_name_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(
+            navigation, text="→", width=5, command=lambda: self._change_image(1),
+            state=tk.NORMAL if len(self.images) > 1 else tk.DISABLED,
+            bg=APP_THEME["surface_alt"], fg=APP_THEME["text"],
+            activebackground=APP_THEME["border"], activeforeground=APP_THEME["text"],
+            relief=tk.FLAT, bd=0, font=("Segoe UI Symbol", 12),
+        ).pack(side=tk.RIGHT)
         self.photo = self._build_photo()
         self.image_label = tk.Label(preview_card, image=self.photo, bd=0, bg=APP_THEME["surface"])
         self.image_label.image = self.photo
         self.image_label.pack(fill=tk.BOTH, expand=True)
-        footer = tk.Frame(shell, bg=APP_THEME["bg"])
-        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
         button_frame = tk.Frame(footer, bg=APP_THEME["bg"])
         button_frame.pack(anchor="w")
-        tk.Button(
-            button_frame,
-            text="下载",
-            width=16,
-            font=("Microsoft YaHei UI", 10),
-            bg=APP_THEME["accent"],
-            fg="#ffffff",
-            activebackground=APP_THEME["accent_dark"],
-            activeforeground="#ffffff",
-            relief=tk.FLAT,
-            bd=0,
-            padx=14,
-            pady=8,
-            command=self._download_with_picker,
-        ).pack(side=tk.LEFT, padx=8)
+        choices = [("下载原版 BOX", "original")]
+        if len(self.images) > 1:
+            choices.extend((("下载属性 BOX", "element"), ("下载两张", "both")))
+        for label, selection in choices:
+            tk.Button(
+                button_frame,
+                text=label,
+                width=16,
+                font=("Microsoft YaHei UI", 10),
+                bg=APP_THEME["accent"],
+                fg="#ffffff",
+                activebackground=APP_THEME["accent_dark"],
+                activeforeground="#ffffff",
+                relief=tk.FLAT,
+                bd=0,
+                padx=14,
+                pady=8,
+                command=lambda choice=selection: self._download_with_picker(choice),
+            ).pack(side=tk.LEFT, padx=8)
         tk.Button(
             button_frame,
             text="关闭窗口",
@@ -634,18 +771,33 @@ class BoxPreviewPopup:
         ).pack(side=tk.LEFT, padx=8)
         self.status_label = tk.Label(
             footer,
-            text="关闭窗口等价于放弃本次下载，临时预览图会自动删除。",
+            text=(f"属性 BOX 图生成失败：{self.element_error}" if self.element_error else
+                  "关闭窗口等价于放弃本次下载，临时预览图会自动删除。"),
             font=("Microsoft YaHei UI", 9),
             fg=APP_THEME["muted"],
             bg=APP_THEME["bg"],
+            wraplength=max(520, window_width - 100),
         )
         self.status_label.pack(anchor="w", pady=(10, 0))
 
     def _build_photo(self):
         resampling = getattr(Image, "Resampling", Image)
-        image = Image.open(self.image_path)
-        image.thumbnail(self.preview_max_size, resampling.LANCZOS)
-        return ImageTk.PhotoImage(image)
+        with Image.open(self.images[self.current_index][1]) as image:
+            preview = image.copy()
+        preview.thumbnail(self.preview_max_size, resampling.LANCZOS)
+        return ImageTk.PhotoImage(preview)
+
+    def _current_image_title(self):
+        return f"{self.images[self.current_index][0]}  {self.current_index + 1}/{len(self.images)}"
+
+    def _change_image(self, direction):
+        if len(self.images) < 2 or self.closed:
+            return
+        self.current_index = (self.current_index + direction) % len(self.images)
+        self.photo = self._build_photo()
+        self.image_label.configure(image=self.photo)
+        self.image_label.image = self.photo
+        self.image_name_label.configure(text=self._current_image_title())
 
     def set_status(self, text, color="#666666"):
         if self.status_label is None or self.closed:
@@ -677,13 +829,13 @@ class BoxPreviewPopup:
         self.root = None
         self.closed = True
 
-    def _download_with_picker(self):
+    def _download_with_picker(self, selection="original"):
         directory = filedialog.askdirectory(title="选择 BOX 图保存位置")
         if not directory:
             self.set_status("未选择保存位置，本次不会开始下载。", "#666666")
             return
         self.selected_dir = Path(directory)
-        self.choice = "download"
+        self.choice = selection
         self.close()
 
     def _handle_close(self):
@@ -721,6 +873,8 @@ def clear_login_state():
     return removed
 
 def build_self_command(extra_args):
+    if FROZEN:
+        return [sys.executable, *extra_args]
     return [sys.executable, "-X", "utf8", "-u", str(Path(__file__).resolve()), *extra_args]
 
 def get_hidden_subprocess_kwargs():
@@ -797,6 +951,7 @@ class MainApp:
         self.mapping_history_listbox = None
         self.mapping_history_preview = None
         self.mapping_history_files = []
+        self.show_browser_var = tk.BooleanVar(master=self.root, value=load_show_browser())
         self._build_ui()
         self.refresh_summary_cards()
         self.set_runtime_state("idle", "等待操作")
@@ -922,8 +1077,8 @@ class MainApp:
             0,
             0,
             "一键同步 BOX",
-            "自动完成登录、抓取，并使用当前映射表生成 BOX 图后进入预览导出。",
-            "适合日常同步，不会自动更新映射表",
+            "自动完成登录、抓取全量 ID 与突破数据，更新映射表后生成 BOX 图并进入预览导出。",
+            "适合日常同步；发现新角色时会弹出头像匹配确认",
             "立即开始",
             lambda: self.start_subprocess(["--sync-box"], "一键同步 BOX"),
             accent=True,
@@ -962,7 +1117,7 @@ class MainApp:
         ).pack(anchor="w")
         tk.Label(
             text_area,
-            text="抓取最新 SS/SSR 全量 ID，并按现有规则自动补齐映射与历史归档。",
+            text="更新 SS/SSR 映射；遇到未知前缀时可选择用圆形头像查找 BOX 对应项。",
             bg=APP_THEME["surface"],
             fg=APP_THEME["muted"],
             font=("Microsoft YaHei UI", 9),
@@ -1190,6 +1345,27 @@ class MainApp:
             fg=APP_THEME["muted"],
             font=("Microsoft YaHei UI", 9),
         ).pack(anchor="w", pady=(6, 14))
+        browser_checkbox = tk.Checkbutton(
+            shell,
+            text="运行时显示浏览器窗口",
+            variable=self.show_browser_var,
+            command=self.on_browser_visibility_changed,
+            bg=APP_THEME["bg"],
+            fg=APP_THEME["text"],
+            selectcolor=APP_THEME["surface"],
+            activebackground=APP_THEME["bg"],
+            activeforeground=APP_THEME["text"],
+            font=("Microsoft YaHei UI", 10),
+        )
+        browser_checkbox.pack(anchor="w")
+        self.action_buttons.append(browser_checkbox)
+        tk.Label(
+            shell,
+            text="开启后，后续任务会显示 B 站、原版 BOX 和属性 BOX 的自动化浏览器窗口。",
+            bg=APP_THEME["bg"],
+            fg=APP_THEME["muted"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", pady=(2, 12))
         content = tk.Frame(shell, bg=APP_THEME["bg"])
         content.pack(fill=tk.BOTH, expand=True)
         content.grid_columnconfigure(0, weight=1)
@@ -1248,6 +1424,16 @@ class MainApp:
                 command=command,
             )
             button.pack(anchor="w")
+
+    def on_browser_visibility_changed(self):
+        enabled = self.show_browser_var.get()
+        try:
+            save_show_browser(enabled)
+        except OSError as exc:
+            self.show_browser_var.set(load_show_browser())
+            messagebox.showerror("保存设置失败", str(exc), parent=self.advanced_window or self.root)
+            return
+        self.append_log("主界面", "后续任务将显示浏览器窗口。" if enabled else "后续任务将隐藏浏览器窗口。")
 
     def close_advanced_window(self):
         if self.advanced_window is not None and self.advanced_window.winfo_exists():
@@ -1655,6 +1841,12 @@ class MainApp:
         if self.current_process is not None:
             messagebox.showinfo("任务进行中", "当前已有任务在运行，请等待完成后再试。", parent=self.root)
             return
+        if any(arg in extra_args for arg in ("--sync-box", "--update-mapping", "--generate-box-write-data")):
+            try:
+                load_mapping_table()
+            except RuntimeError as exc:
+                messagebox.showerror("映射表错误", str(exc), parent=self.root)
+                return
         command = build_self_command(extra_args)
         self.append_log("主界面", f"开始执行: {task_name}")
         self.set_busy(True, f"正在执行: {task_name}")
@@ -1754,6 +1946,7 @@ class MainApp:
 
 def launch_main_window():
     ensure_dirs()
+    load_mapping_table()
     app = MainApp()
     app.run()
 
@@ -1993,7 +2186,7 @@ def read_box_page_state(page, button_texts=None):
     button_texts = list(button_texts or [])
     try:
         return page.evaluate(
-            """([regions, selectors, keywords, buttonTexts]) => {
+            """([regions, selectors, keywords, buttonTexts, downloadIconPrefix]) => {
                 const serializeRect = (node) => {
                     if (!node) return null;
                     const rect = node.getBoundingClientRect();
@@ -2035,31 +2228,6 @@ def read_box_page_state(page, button_texts=None):
                     .filter(Boolean)
                     .sort((a, b) => a.area - b.area);
 
-                const regionCandidates = bodyNodes
-                    .map((node) => {
-                        const value = (node.innerText || node.textContent || '').trim();
-                        if (!regions.includes(value)) return null;
-                        const rect = serializeRect(node);
-                        if (!rect) return null;
-                        return { value, rect };
-                    })
-                    .filter(Boolean)
-                    .sort((a, b) => a.rect.area - b.rect.area);
-
-                const regionButtons = {};
-                regionCandidates.forEach((item) => {
-                    if (!regionButtons[item.value]) {
-                        regionButtons[item.value] = item.rect;
-                    }
-                });
-
-                let region = regionCandidates.length ? regionCandidates[0].value : 'unknown';
-                if (region === 'unknown') {
-                    if (text.includes('CN')) region = 'CN';
-                    else if (text.includes('JP')) region = 'JP';
-                    else if (text.includes('EN')) region = 'EN';
-                }
-
                 const fixedElements = bodyNodes
                     .map((el) => {
                         const style = window.getComputedStyle(el);
@@ -2088,6 +2256,22 @@ def read_box_page_state(page, button_texts=None):
                     )
                     .sort((a, b) => a.area - b.area);
 
+                const regionCandidates = expandedToolbars.length
+                    ? Array.from(expandedToolbars[0].node.children)
+                        .filter(isVisible)
+                        .map((node) => {
+                            const value = (node.innerText || node.textContent || '').trim();
+                            const rect = serializeRect(node);
+                            return regions.includes(value) && rect ? { value, rect } : null;
+                        })
+                        .filter(Boolean)
+                    : [];
+                const regionButtons = {};
+                regionCandidates.forEach((item) => {
+                    regionButtons[item.value] = item.rect;
+                });
+                const region = regionCandidates.length === 1 ? regionCandidates[0].value : 'unknown';
+
                 let toolbarState = 'unknown';
                 if (expandedToolbars.length) toolbarState = 'expanded';
                 else if (collapsedToolbars.length) toolbarState = 'collapsed';
@@ -2104,12 +2288,11 @@ def read_box_page_state(page, button_texts=None):
                 let downloadStrategy = '';
                 if (expandedToolbars.length) {
                     const toolbarNode = expandedToolbars[0].node;
-                    const downloadHints = ['download', 'save', 'export', '下载', '保存', '导出'];
-                    const downloadCandidates = Array.from(toolbarNode.querySelectorAll('*'))
-                        .filter((node) => node !== toolbarNode && isVisible(node))
+                    const downloadCandidates = Array.from(toolbarNode.children)
+                        .filter(isVisible)
                         .map((node) => {
                             const rect = serializeRect(node);
-                            if (!rect) return null;
+                            if (!rect || rect.width < 40 || rect.height < 40) return null;
                             const style = window.getComputedStyle(node);
                             const textValue = (node.innerText || node.textContent || '').trim();
                             const titleValue = (node.getAttribute('title') || '').trim();
@@ -2118,26 +2301,21 @@ def read_box_page_state(page, button_texts=None):
                             const idValue = (node.id || '').trim();
                             const bgValue = style.backgroundImage || '';
                             const hintText = `${textValue} ${titleValue} ${ariaValue} ${classValue} ${idValue}`.toLowerCase();
-                            let score = 0;
-                            if (downloadHints.some((hint) => hintText.includes(hint))) score += 100;
-                            if (titleValue || ariaValue) score += 25;
-                            if (node.querySelector('svg, img') || node.tagName === 'SVG' || node.tagName === 'IMG') score += 15;
-                            if (bgValue.includes('data:image') || bgValue.includes('url(')) score += 10;
-                            if (rect.width > 100 && rect.height > 100 && !textValue && rect.y >= 180 && rect.y <= 320) score += 40;
-                            if (rect.width >= 24 && rect.height >= 24) score += 5;
                             return {
                                 rect,
-                                score,
-                                semantic: score >= 100,
+                                icon: !textValue && bgValue.includes(downloadIconPrefix),
+                                semantic: /(?:^|[\\s_-])(?:download|save|export)(?:$|[\\s_-])|下载|保存|导出/.test(hintText),
                             };
                         })
-                        .filter(Boolean)
-                        .filter((item) => item.score > 0)
-                        .sort((a, b) => b.score - a.score || a.rect.area - b.rect.area);
-
-                    if (downloadCandidates.length) {
-                        downloadRect = downloadCandidates[0].rect;
-                        downloadStrategy = downloadCandidates[0].semantic ? 'semantic' : 'geometry';
+                        .filter(Boolean);
+                    const iconMatches = downloadCandidates.filter((item) => item.icon);
+                    const semanticMatches = downloadCandidates.filter((item) => item.semantic);
+                    if (iconMatches.length === 1) {
+                        downloadRect = iconMatches[0].rect;
+                        downloadStrategy = 'icon';
+                    } else if (!iconMatches.length && semanticMatches.length === 1) {
+                        downloadRect = semanticMatches[0].rect;
+                        downloadStrategy = 'semantic';
                     }
                 }
 
@@ -2179,7 +2357,8 @@ def read_box_page_state(page, button_texts=None):
                     regionButtons,
                 };
             }""",
-            [list(BOX_REGION_OPTIONS), BOX_READY_SELECTORS, BOX_READY_KEYWORDS, button_texts],
+            [list(BOX_REGION_OPTIONS), BOX_READY_SELECTORS, BOX_READY_KEYWORDS,
+             button_texts, BOX_DOWNLOAD_ICON_PREFIX],
         ) or {}
     except Exception as exc:
         if is_box_transient_navigation_error(exc):
@@ -2252,8 +2431,8 @@ def detect_box_region(page):
         raise
 
 def click_box_region_button(page, region):
-    state = read_box_page_state(page, button_texts=[region])
-    rect = (state.get("regionButtons") or {}).get(region) or ((state.get("buttonCandidates") or [None])[0])
+    state = read_box_page_state(page)
+    rect = (state.get("regionButtons") or {}).get(region)
     return click_box_rect(page, rect, f"{region}语言切换")
 
 def wait_box_region_switch_stable(page, previous_region, timeout_ms=BOX_REGION_SWITCH_TIMEOUT_MS):
@@ -2301,7 +2480,7 @@ def ensure_box_region_cn(page):
         if current == "CN":
             return "CN"
         if current in ("JP", "EN"):
-            rect = (state.get("regionButtons") or {}).get(current) or ((state.get("buttonCandidates") or [None])[0])
+            rect = (state.get("regionButtons") or {}).get(current)
             click_box_rect(page, rect, f"{current}语言切换")
             return wait_box_region_switch_stable(page, current)
         if toolbar_state == "collapsed":
@@ -2401,8 +2580,8 @@ def capture_box_preview(page, output_path=None):
     log("BOX页面", f"预览图已生成: {preview_path}")
     return preview_path
 
-def show_box_preview_popup(preview_path):
-    popup = BoxPreviewPopup(preview_path)
+def show_box_preview_popup(preview_path, element_path=None, element_error=None):
+    popup = BoxPreviewPopup(preview_path, element_path, element_error)
     popup.open()
     log("BOX页面", "预览窗口已弹出，请选择下载、另存位置或直接关闭窗口。")
     try:
@@ -2552,11 +2731,32 @@ def open_box_site(page):
             pass
         page.wait_for_timeout(BOX_GOTO_RETRY_WAIT_MS)
 
-def run_box_preview_download(write_data=None):
+def cleanup_element_future(element_future):
+    try:
+        cleanup_temp_file(element_future.result())
+    except Exception:
+        pass
+
+
+def run_box_preview_download(write_data=None, element_future=None, headless=None):
     ensure_dirs()
+    if headless is None:
+        headless = browser_headless()
+    if element_future is not None:
+        return _run_box_preview_download(write_data, element_future, headless)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="element-box") as executor:
+        log("属性BOX", "正在并行生成按属性分类的 BOX 图...")
+        element_future = executor.submit(create_element_box_preview, headless)
+        try:
+            return _run_box_preview_download(write_data, element_future, headless)
+        finally:
+            cleanup_element_future(element_future)
+
+
+def _run_box_preview_download(write_data, element_future, headless):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
-            headless=BROWSER_HEADLESS,
+            headless=headless,
             args=[f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}"],
         )
         context = browser.new_context(
@@ -2571,6 +2771,7 @@ def run_box_preview_download(write_data=None):
         page = context.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT_MS)
         preview_path = None
+        element_path = None
         preview_is_download = False
         try:
             open_box_site(page)
@@ -2587,28 +2788,43 @@ def run_box_preview_download(write_data=None):
                 preview_is_download = False
                 log("BOX页面", f"预览下载失败，改用截图预览: {exc}")
                 preview_path = capture_box_preview(page)
-            choice, selected_dir = show_box_preview_popup(preview_path)
-            if choice != "download":
+            element_error = None
+            try:
+                element_path = element_future.result()
+                log("属性BOX", "属性 BOX 图已生成，可与原版 BOX 图切换预览。")
+            except Exception as exc:
+                cleanup_temp_file(element_path)
+                element_path = None
+                element_error = str(exc)
+                log("属性BOX", f"属性 BOX 图生成失败，仍可预览原版 BOX 图: {exc}")
+            choice, selected_dir = show_box_preview_popup(preview_path, element_path, element_error)
+            if choice not in ("original", "element", "both", "download"):
                 log("BOX页面", "预览窗口已关闭，本次不执行下载。")
-                cleanup_temp_file(preview_path)
                 return None
             save_dir = selected_dir or BOX_OUTPUT_DIR
-            try:
-                if preview_is_download:
-                    result_path = finalize_temp_box_download(preview_path, save_dir)
-                    preview_path = None
-                else:
-                    result_path = download_box_image(page, save_dir)
-                cleanup_temp_file(preview_path)
-                return result_path
-            except Exception as exc:
-                log("BOX页面", f"网站下载失败: {exc}")
-                if ask_download_fallback():
-                    result_path = save_box_screenshot_fallback(page, save_dir)
-                    cleanup_temp_file(preview_path)
-                    return result_path
-                cleanup_temp_file(preview_path)
-                raise RuntimeError("网站下载失败，且用户未选择截图兜底。") from exc
+            saved = {}
+            if choice in ("original", "both", "download"):
+                try:
+                    if preview_is_download:
+                        saved["original"] = finalize_temp_box_download(preview_path, save_dir)
+                        preview_path = None
+                    else:
+                        saved["original"] = download_box_image(page, save_dir)
+                except Exception as exc:
+                    log("BOX页面", f"网站下载失败: {exc}")
+                    if ask_download_fallback():
+                        saved["original"] = save_box_screenshot_fallback(page, save_dir)
+                    else:
+                        raise RuntimeError("原版 BOX 图下载失败，且用户未选择截图兜底。") from exc
+            if choice in ("element", "both"):
+                if element_path is None:
+                    raise RuntimeError("属性 BOX 图尚未生成，无法下载。")
+                target = make_box_output_path(save_dir, "_属性")
+                shutil.move(str(element_path), str(target))
+                element_path = None
+                saved["element"] = target
+                log("属性BOX", f"属性 BOX 图已保存到: {target}")
+            return saved if choice == "both" else next(iter(saved.values()))
         except Exception as exc:
             log("错误", str(exc))
             try:
@@ -2618,6 +2834,7 @@ def run_box_preview_download(write_data=None):
             raise
         finally:
             cleanup_temp_file(preview_path)
+            cleanup_temp_file(element_path)
             context.close()
             browser.close()
 
@@ -2625,7 +2842,7 @@ def run_box_initial_shot():
     ensure_dirs()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
-            headless=BROWSER_HEADLESS,
+            headless=browser_headless(),
             args=[f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}"],
         )
         context = browser.new_context(
@@ -2773,56 +2990,19 @@ def click_text_in_page(page, target_text):
         target_text,
     )
 
-def click_hbr_tab(page, tab_name, tab_index):
-    result = page.evaluate(
-        f"""([selector, targetName, targetIndex]) => {{
-            const tabs = Array.from(document.querySelectorAll(selector));
-            if (!tabs.length) {{
-                return {{ clicked: false, reason: '未找到 tab' }};
-            }}
-            const exactTab = tabs.find((tab) => {{
-                const text = (tab.innerText || tab.textContent || '').trim();
-                return text === targetName;
-            }});
-            const target = exactTab || tabs[targetIndex] || null;
-            if (!target) {{
-                return {{
-                    clicked: false,
-                    reason: '目标 tab 不存在',
-                    tabs: tabs.map((tab, index) => ({{
-                        index,
-                        text: (tab.innerText || tab.textContent || '').trim(),
-                    }})),
-                }};
-            }}
-            try {{
-                target.scrollIntoView({{ block: 'center', inline: 'center' }});
-            }} catch (error) {{}}
-            ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {{
-                target.dispatchEvent(
-                    new MouseEvent(eventName, {{ bubbles: true, cancelable: true, view: window }})
-                );
-            }});
-            if (typeof target.click === 'function') {{
-                target.click();
-            }}
-            return {{
-                clicked: true,
-                text: (target.innerText || target.textContent || '').trim(),
-                tabs: tabs.map((tab, index) => ({{
-                    index,
-                    text: (tab.innerText || tab.textContent || '').trim(),
-                    className: tab.className || '',
-                    ariaSelected: tab.getAttribute('aria-selected') || '',
-                }})),
-            }};
-        }}""",
-        [HBR_TAB_SELECTORS, tab_name, tab_index],
-    )
-    if not result.get("clicked"):
-        raise RuntimeError(f"点击 HBR 页签失败: {result.get('reason', '未知错误')}")
-    log("HBR档案", f"已点击页签: {result.get('text') or tab_name}")
-    return result
+def click_hbr_tab(page, tab_name):
+    tab = page.get_by_role("tab", name=tab_name, exact=True)
+    try:
+        tab.first.wait_for(state="visible", timeout=HBR_SELECTOR_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(f"点击 HBR 页签失败: {tab_name} 匹配到 0 个页签") from exc
+    count = tab.count()
+    if count != 1:
+        raise RuntimeError(f"点击 HBR 页签失败: {tab_name} 匹配到 {count} 个页签")
+    if tab.get_attribute("aria-selected") != "true":
+        tab.click(timeout=HBR_SELECTOR_TIMEOUT_MS)
+        log("HBR档案", f"已点击页签: {tab_name}")
+    return {"clicked": True, "text": tab_name}
 
 def prepare_hbr_page_for_extract(page):
     for attempt in range(1, HBR_PREPARE_RETRIES + 1):
@@ -2844,41 +3024,56 @@ def prepare_hbr_page_for_extract(page):
 
 def open_hbr_archive_page(page):
     last_text = ""
-    for attempt in range(1, 4):
-        click_hbr_tab(page, "档案", HBR_ARCHIVE_TAB_INDEX)
-        page.wait_for_timeout(1200)
+    click_hbr_tab(page, "档案")
+    deadline = time.monotonic() + HBR_ARCHIVE_READY_TIMEOUT_MS / 1000
+    while time.monotonic() < deadline:
         last_text = get_page_text(page)
         if any(keyword in last_text for keyword in HBR_ARCHIVE_READY_KEYWORDS):
-            log("HBR档案", f"已进入档案页，第 {attempt} 次确认成功。")
+            log("HBR档案", "档案页内容已出现。")
             return
+        page.wait_for_timeout(250)
     raise RuntimeError(
         "进入档案页失败，未检测到预期关键字。当前页面文本片段: "
         + last_text[:200].replace("\n", " ")
     )
 
 def open_hbr_archive_all_view(page):
-    open_hbr_archive_page(page)
-    last_result = None
-    for attempt in range(1, 5):
-        last_result = click_text_in_page(page, HBR_ARCHIVE_VIEW_ALL_TEXT)
-        if last_result and last_result.get("clicked"):
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            open_hbr_archive_page(page)
+            view_all = page.get_by_text(HBR_ARCHIVE_VIEW_ALL_TEXT, exact=True).filter(visible=True).first
+            view_all.click(timeout=HBR_ARCHIVE_VIEW_ALL_TIMEOUT_MS)
             log(
                 "HBR档案",
-                f"第 {attempt} 次已点击“{HBR_ARCHIVE_VIEW_ALL_TEXT}”，命中节点: {last_result.get('tag', '')} {last_result.get('className', '')}".strip(),
+                f"第 {attempt} 次已点击“{HBR_ARCHIVE_VIEW_ALL_TEXT}”。",
             )
-            page.wait_for_timeout(1200)
             return
-        page.wait_for_timeout(400)
+        except (PlaywrightTimeoutError, RuntimeError) as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            reason = str(exc).splitlines()
+            log("HBR档案", f"“{HBR_ARCHIVE_VIEW_ALL_TEXT}”暂未就绪，刷新档案页后重试: {reason[0] if reason else type(exc).__name__}")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                log("HBR档案", "页面刷新较慢，继续等待档案页。")
+            try:
+                page.wait_for_load_state("networkidle", timeout=HBR_PAGE_IDLE_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                pass
     raise RuntimeError(
-        f"未能点击“{HBR_ARCHIVE_VIEW_ALL_TEXT}”，最近一次结果: {last_result}"
-    )
+        f"未能点击“{HBR_ARCHIVE_VIEW_ALL_TEXT}”（已刷新重试一次），当前页面: {page.url}"
+    ) from last_error
 
 def get_visible_hbr_break_data(page):
     return page.evaluate(
         f"""() => {{
-            const elements = document.querySelectorAll('{HBR_CARD_SELECTOR}');
+            const elements = document.querySelectorAll('{HBR_ARCHIVE_CARD_SELECTOR}');
             const rows = [];
             elements.forEach((el) => {{
+                if (!el.querySelector('.level')?.textContent?.trim()) return;
                 const rarityImg = el.querySelector('.role-rarity');
                 if (!rarityImg) return;
                 const src = rarityImg.src || '';
@@ -2905,10 +3100,10 @@ def extract_hbr_break_data(page):
     open_hbr_archive_all_view(page)
     page.wait_for_function(
         f"""() => {{
-            const elements = document.querySelectorAll('{HBR_CARD_SELECTOR}');
+            const elements = document.querySelectorAll('{HBR_ARCHIVE_CARD_SELECTOR}');
             return Array.from(elements).some((el) => {{
                 const rarityImg = el.querySelector('.role-rarity');
-                return !!(rarityImg && el.dataset && el.dataset.id);
+                return !!(rarityImg && el.dataset.id && el.querySelector('.level')?.textContent?.trim());
             }});
         }}""",
         timeout=max(HBR_SELECTOR_TIMEOUT_MS, 30000),
@@ -3107,13 +3302,39 @@ def run_hbr_update(page, enabled=False):
     return ids
 
 def run_full_box_sync():
-    hbr_result = bilibili_login(update_bili_ids=False, update_break_data=True)
-    break_rows = hbr_result.get("break_rows") or []
-    if not break_rows:
-        raise RuntimeError("未获取到 B站 SS/SSR 突破数据，无法同步 BOX 图。")
+    headless = browser_headless()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="element-box") as executor:
+        log("属性BOX", "一键同步开始，正在并行生成按属性分类的 BOX 图...")
+        element_future = executor.submit(create_element_box_preview, headless)
+        try:
+            log("BOX同步", "第 1/3 步：登录并抓取 B站全量 SS/SSR ID 与突破数据...")
+            hbr_result = bilibili_login(update_bili_ids=True, update_break_data=True)
+            break_rows = hbr_result.get("break_rows") or []
+            if not break_rows:
+                raise RuntimeError("未获取到 B站 SS/SSR 突破数据，无法同步 BOX 图。")
+            log("BOX同步", "第 2/3 步：更新 SS/SSR 映射表...")
+            mapping = update_mapping_for_box_sync(hbr_result)
+            write_data = build_box_write_data(mapping, break_rows)
+            log("BOX同步", "第 3/3 步：打开 BOX 图网站并生成预览图...")
+            return run_box_preview_download(
+                write_data=write_data, element_future=element_future, headless=headless,
+            )
+        finally:
+            cleanup_element_future(element_future)
+
+def run_install_check():
+    ensure_dirs()
     mapping = load_mapping_table()
-    write_data = build_box_write_data(mapping, break_rows)
-    return run_box_preview_download(write_data=write_data)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto("data:text/html,<title>box-install-check</title>")
+            if page.title() != "box-install-check":
+                raise RuntimeError("浏览器安装检查失败。")
+        finally:
+            browser.close()
+    log("安装检查", f"通过：映射 {len(mapping)} 条，浏览器可启动，数据目录 {BASE_DIR}")
 
 def bilibili_login(update_bili_ids=False, update_break_data=False):
     ensure_dirs()
@@ -3121,7 +3342,7 @@ def bilibili_login(update_bili_ids=False, update_break_data=False):
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
-            headless=BROWSER_HEADLESS,
+            headless=browser_headless(),
             viewport=VIEWPORT,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -3131,6 +3352,20 @@ def bilibili_login(update_bili_ids=False, update_break_data=False):
             args=[f"--window-size={VIEWPORT['width']},{VIEWPORT['height']}"],
         )
         page = get_working_page(context)
+        avatar_roles = {}
+        if update_bili_ids:
+            def collect_avatar_roles(response):
+                if "/game/player/tools/fever/role/list" not in response.url:
+                    return
+                try:
+                    payload = response.json()
+                    for role in payload.get("data", {}).get("role_list", []):
+                        if role.get("role_icon") and role.get("role_id") is not None:
+                            avatar_roles[str(role["role_id"])] = role
+                except Exception as exc:
+                    log("头像匹配", f"读取 B 站圆形头像数据失败: {exc}")
+
+            page.on("response", collect_avatar_roles)
         popup = None
         qr_path = None
         hbr_ids = None
@@ -3143,7 +3378,7 @@ def bilibili_login(update_bili_ids=False, update_break_data=False):
                 open_hbr_page(page)
                 hbr_ids = run_hbr_update(page, enabled=update_bili_ids)
                 hbr_break_rows = run_hbr_break_update(page, enabled=update_break_data)
-                return {"ids": hbr_ids, "break_rows": hbr_break_rows}
+                return {"ids": hbr_ids, "break_rows": hbr_break_rows, "avatar_roles": avatar_roles}
             open_login_page(page)
             try:
                 qr_path = capture_qr_image(page)
@@ -3167,7 +3402,7 @@ def bilibili_login(update_bili_ids=False, update_break_data=False):
                 save_debug_screenshot(page, "hbr_page_error")
                 raise
             log("流程", "登录流程执行完成。")
-            return {"ids": hbr_ids, "break_rows": hbr_break_rows}
+            return {"ids": hbr_ids, "break_rows": hbr_break_rows, "avatar_roles": avatar_roles}
         except Exception as exc:
             log("错误", str(exc))
             try:
@@ -3188,9 +3423,14 @@ def bilibili_login(update_bili_ids=False, update_break_data=False):
 def parse_args():
     parser = argparse.ArgumentParser(description="B 站 HBR 登录与可选数据抓取工具")
     parser.add_argument(
+        "--check-install",
+        action="store_true",
+        help="离线检查安装版的映射表和浏览器能否正常使用",
+    )
+    parser.add_argument(
         "--sync-box",
         action="store_true",
-        help="从 B站抓取突破数据并同步到 BOX 图网站，再进入预览/下载流程",
+        help="从 B站抓取全量 ID 与突破数据，更新映射表后同步到 BOX 图网站，再进入预览/下载流程",
     )
     parser.add_argument(
         "--box-initial-shot",
@@ -3220,7 +3460,7 @@ def parse_args():
     parser.add_argument(
         "--update-mapping",
         action="store_true",
-        help="抓取最新 B站 SS/SSR 全量 ID，并按现有规则更新映射表",
+        help="抓取最新 B站 SS/SSR ID 并更新映射，未知前缀时可选择头像匹配",
     )
     parser.add_argument(
         "--generate-box-write-data",
@@ -3236,7 +3476,9 @@ def parse_args():
 if __name__ == "__main__":
     configure_stdio()
     args = parse_args()
-    if args.sync_box:
+    if args.check_install:
+        run_install_check()
+    elif args.sync_box:
         run_full_box_sync()
     elif args.box_preview_download:
         run_box_preview_download()
